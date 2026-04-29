@@ -3,13 +3,16 @@
 import json
 import os
 import shutil
+import time
 import logging
-from typing import List, Dict, Any
+from typing import List, Dict, Any, TypeVar, Callable
 from collections import defaultdict
 
 import clickhouse_connect
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 
 class ClickHouseFetcherService:
@@ -36,6 +39,42 @@ class ClickHouseFetcherService:
             logger.info("ClickHouse client connected to %s:%s/%s",
                         self.config.olap_host, self.config.olap_port, self.config.olap_database)
         return self._client
+
+    def _reset_client(self) -> None:
+        """Drops the cached client so the next get_client() reconnects."""
+        self._client = None
+
+    def _execute_with_retry(self, operation: Callable[[], T], label: str) -> T:
+        """Wraps a ClickHouse operation with retry + exponential backoff.
+
+        On connection errors the cached client is reset so the next
+        attempt establishes a fresh connection.  Uses the same retry
+        settings as per-trace processing (retry_max_attempts / retry_backoff_base).
+        """
+        max_attempts = self.config.retry_max_attempts
+        backoff_base = self.config.retry_backoff_base
+
+        for attempt in range(max_attempts):
+            try:
+                return operation()
+            except Exception as e:
+                is_last = attempt >= max_attempts - 1
+                # Reset client on connection-level errors so we reconnect
+                self._reset_client()
+
+                if is_last:
+                    logger.error(
+                        "ClickHouse %s failed after %d attempts: %s",
+                        label, max_attempts, e,
+                    )
+                    raise
+
+                wait = backoff_base * (2 ** attempt)
+                logger.warning(
+                    "ClickHouse %s — retry %d/%d in %.1fs: %s",
+                    label, attempt + 1, max_attempts, wait, e,
+                )
+                time.sleep(wait)
 
     # ── 2. Watermark Persistence (dedup) ──────────────────────────────
 
@@ -97,7 +136,6 @@ class ClickHouseFetcherService:
             cutoff_ts: Only fetch rows up to this timestamp (inclusive).
                        Used to bound the drain loop to a snapshot time.
         """
-        client = self.get_client()
         table = self.config.olap_table
         batch_size = self.config.fetch_batch_size
 
@@ -115,7 +153,11 @@ class ClickHouseFetcherService:
             f"LIMIT %(limit)s"
         )
 
-        result = client.query(query, parameters=params)
+        def _do_fetch():
+            client = self.get_client()
+            return client.query(query, parameters=params)
+
+        result = self._execute_with_retry(_do_fetch, "fetch_batch")
 
         # Convert to list of dicts using column names
         columns = result.column_names
@@ -146,7 +188,6 @@ class ClickHouseFetcherService:
         if not correlation_ids:
             return {}
 
-        client = self.get_client()
         table = self.config.olap_table
 
         query = (
@@ -155,7 +196,11 @@ class ClickHouseFetcherService:
             f"GROUP BY correlationId"
         )
 
-        result = client.query(query, parameters={"cids": correlation_ids})
+        def _do_count():
+            client = self.get_client()
+            return client.query(query, parameters={"cids": correlation_ids})
+
+        result = self._execute_with_retry(_do_count, "bulk_count_cids")
         counts = {row[0]: row[1] for row in result.result_rows}
         logger.debug("Bulk CID counts: %d CIDs checked", len(counts))
         return counts
@@ -166,7 +211,6 @@ class ClickHouseFetcherService:
         Ignores the watermark — pulls the complete history for this CID.
         Used when a partial trace is detected via bulk_count_cids().
         """
-        client = self.get_client()
         table = self.config.olap_table
 
         query = (
@@ -175,7 +219,11 @@ class ClickHouseFetcherService:
             f"ORDER BY timestamp ASC"
         )
 
-        result = client.query(query, parameters={"cid": correlation_id})
+        def _do_fetch_cid():
+            client = self.get_client()
+            return client.query(query, parameters={"cid": correlation_id})
+
+        result = self._execute_with_retry(_do_fetch_cid, "fetch_rows_for_cid")
         columns = result.column_names
         rows = [dict(zip(columns, row)) for row in result.result_rows]
 
