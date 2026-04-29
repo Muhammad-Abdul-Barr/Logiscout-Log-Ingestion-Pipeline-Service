@@ -1,0 +1,6 @@
+# Logs Ingestion Pipeline (Without Spark)
+pydantic
+python-dotenv
+fastembed
+qdrant-client
+clickhouse-connect

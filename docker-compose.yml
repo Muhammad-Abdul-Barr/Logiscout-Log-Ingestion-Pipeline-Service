@@ -1,0 +1,33 @@
+# ════════════════════════════════════════════════════════════════
+#  LogiScout Logs Ingestion Pipeline (Without Spark) — Docker Compose
+# ════════════════════════════════════════════════════════════════
+
+services:
+
+  # ── Qdrant Vector Database ──────────────────────────────────
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: logiscout-qdrant
+    ports:
+      - "6333:6333"   # REST API
+      - "6334:6334"   # gRPC
+    volumes:
+      - qdrant_data:/qdrant/storage
+    restart: unless-stopped
+
+  # ── Logs Ingestion Pipeline (Without Spark) ─────────────────
+  pipeline:
+    build: .
+    image: logiscout/logs-ingestion-pipeline:v2
+    container_name: logiscout-logs-pipeline
+    env_file:
+      - .env
+    volumes:
+      - pipeline_data:/app/data    # watermark persistence
+    depends_on:
+      - qdrant
+    restart: unless-stopped
+
+volumes:
+  qdrant_data:
+  pipeline_data:
