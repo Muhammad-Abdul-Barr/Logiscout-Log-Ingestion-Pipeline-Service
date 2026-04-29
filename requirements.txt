@@ -1,6 +1,6 @@
 # Logs Ingestion Pipeline (Without Spark)
-pydantic
-python-dotenv
-fastembed
-qdrant-client
-clickhouse-connect
+pydantic==2.13.3
+python-dotenv==1.2.2
+fastembed==0.8.0
+qdrant-client==1.17.1
+clickhouse-connect==0.15.1
